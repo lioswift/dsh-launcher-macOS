@@ -1,4 +1,5 @@
-# dsh-launcher
+# dsh-launcher-macOS
+
 
 macOS 上把「**本地服务 + Safari 独立窗口**」变成 **Dock 一键启动**的启动器。
 
