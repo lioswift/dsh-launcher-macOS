@@ -1,0 +1,304 @@
+#!/bin/zsh
+# ============================================================================
+# dsh-launcher —— macOS「本地服务 + Safari 独立窗口」一键启动器
+#
+# 点一下 Dock/桌面上的启动器图标：
+#   起本地服务（独立进程组；--no-open，绝不碰你的默认浏览器）
+#   → 起 302 跳板（固定端口 → 服务每次启动生成的动态 URL）
+#   → 打开 Safari WebApp 独立窗口（全屏浏览器不受任何打扰）
+#
+# Cmd+Q 关窗 → 服务/跳板/窗口/渲染进程全部退出，零残留。
+#
+# 默认适配 @deepseek-ai/dsh；改「配置区」即可适配任意本地服务（见 README）。
+# 依赖：macOS、zsh、Node.js（node/npx）、perl（系统自带）
+# 许可证：MIT
+# ============================================================================
+
+# ==================== 配置区 ====================
+APP_NAME="dsh"                                      # 显示名（通知、日志用）
+SVC_CMD=(npx -y @deepseek-ai/dsh web --no-open)     # 起服务的命令（--port 由脚本追加）
+SVC_SIG="dsh web.*--no-open"                        # 识别"本启动器起的服务进程"的 ps 特征（孤儿收尸用）
+PREFERRED_PORT=3080                                 # 服务首选端口；被其它程序占用则自动改用空闲端口
+RPORT=3099                                          # 跳板端口（你的 WebApp 壳应指向它）
+WEBAPP_APP="$HOME/Applications/DSH.app"             # Safari「添加到程序坞」生成的 WebApp 壳路径
+WORKDIR="$HOME/.dsh-launcher"                       # 工作目录（状态文件/日志/守卫副本）
+# ================================================
+
+# Dock 启动的进程不加载 shell 配置（.zshrc 等），PATH 很贫瘠——补上常见的 Node 安装位置
+# （如你的 node 在别处，把它加进下面这个列表即可）
+# 注意 `(N)`：zsh 中 glob 无匹配会报错中止脚本，加 (N) 让不存在的目录安全跳过
+for d in /opt/homebrew/bin /usr/local/bin /opt/anaconda3/bin "$HOME"/.nvm/versions/node/*/bin(N); do
+  [ -d "$d" ] && PATH="$d:$PATH"
+done
+export PATH
+
+export npm_config_cache="$HOME/.npm"                # 固定 npm 缓存，避免继承到异常环境变量
+unset NPM_CONFIG_CACHE
+
+STATE="$WORKDIR/launcher.state"
+GUARD_COPY="$WORKDIR/guard.zsh"                     # 守卫脚本副本（必须跑在 app 外，见 ensure_guard）
+LOGDIR="$WORKDIR/logs"
+BACKEND_LOG="$LOGDIR/service.log"
+REDIRECT_LOG="$LOGDIR/redirect.log"
+LAUNCHER_LOG="$LOGDIR/launcher.log"
+
+SVC_PGID=""; RD_PGID=""; SVC_URL=""
+SELF="${0:A}"                                       # 自身绝对路径（守卫进程自调用用）
+
+log() { echo "[$(date '+%F %T')] $*" >> "$LAUNCHER_LOG"; }
+notify() { osascript -e "display notification \"$1\" with title \"$APP_NAME\"" 2>/dev/null; }
+
+mkdir -p "$WORKDIR" "$LOGDIR" || exit 1
+cd "$WORKDIR" || exit 1
+
+# ---------- 环境自检 ----------
+if ! command -v node >/dev/null 2>&1 || ! command -v npx >/dev/null 2>&1; then
+  notify "未找到 node/npx，请先安装 Node.js"
+  echo "dsh-launcher: node/npx not found" >&2
+  exit 1
+fi
+if [ ! -d "$WEBAPP_APP" ]; then
+  notify "未找到 WebApp 壳（见 README 第 3 步创建）"
+  echo "dsh-launcher: WebApp shell not found: $WEBAPP_APP" >&2
+  exit 1
+fi
+WEBAPP_ID=$(plutil -extract CFBundleIdentifier raw "$WEBAPP_APP/Contents/Info.plist" 2>/dev/null)
+WEBAPP_UUID="${WEBAPP_ID##*.}"                      # com.apple.Safari.WebApp.<UUID> → <UUID>
+if [ -z "$WEBAPP_ID" ]; then
+  notify "无法读取 WebApp 壳的 bundle id"
+  echo "dsh-launcher: cannot read bundle id from $WEBAPP_APP" >&2
+  exit 1
+fi
+
+# ---------- 进程组工具 ----------
+spawn_group() {  # spawn_group <日志文件> <命令...> → SPAWNED_PGID
+  local lg="$1"; shift
+  # perl 先自建进程组再 exec，使整棵进程树同组，方便按组连根灭杀
+  perl -e 'setpgrp(0,0); exec @ARGV; die "exec failed: $!"' -- "$@" > "$lg" 2>&1 &
+  SPAWNED_PGID=$!
+}
+
+pgid_alive() {
+  # 组或 PID 任一存活即算活：刚 spawn 的瞬间 perl 尚未执行 setpgrp，
+  # 此时组还不存在但 PID 已活；setpgrp 生效后组 ID == PID，两种检测等价。
+  [ -n "$1" ] || return 1
+  kill -0 -- "-$1" 2>/dev/null || kill -0 "$1" 2>/dev/null
+}
+
+kill_group() {  # 先 TERM，最多等 3 秒，再 KILL（组不存在时退回单 PID）
+  local pgid="$1" i
+  [ -n "$pgid" ] || return 0
+  kill -s TERM -- "-$pgid" 2>/dev/null || kill -s TERM "$pgid" 2>/dev/null || return 0
+  for i in {1..10}; do
+    pgid_alive "$pgid" || return 0
+    sleep 0.3
+  done
+  kill -s KILL -- "-$pgid" 2>/dev/null || kill -s KILL "$pgid" 2>/dev/null
+}
+
+kill_port_listeners() {  # 只清占着该端口的「我们的跳板」（node -e ...listen(PORT...)），不碰别人的服务
+  local pids p
+  pids=$(lsof -nP -tiTCP:"$1" -sTCP:LISTEN 2>/dev/null)
+  for p in ${(f)pids}; do
+    ps -p "$p" -o command= 2>/dev/null | grep -q "listen($1" && kill "$p" 2>/dev/null
+  done
+  return 0
+}
+
+# ---------- 状态文件 ----------
+read_state() {
+  [ -f "$STATE" ] || return 1
+  S_SVC_PGID=$(grep -m1 '^S_SVC_PGID=' "$STATE" 2>/dev/null | cut -d= -f2-)
+  S_URL=$(grep -m1 '^S_URL=' "$STATE" 2>/dev/null | cut -d= -f2-)
+  S_LAUNCHER_PID=$(grep -m1 '^S_LAUNCHER_PID=' "$STATE" 2>/dev/null | cut -d= -f2-)
+  [ -n "$S_SVC_PGID" ] && [ -n "$S_URL" ]
+}
+
+write_state() {
+  cat > "$STATE" <<EOF
+S_SVC_PGID=$SVC_PGID
+S_URL=$SVC_URL
+S_LAUNCHER_PID=$$
+EOF
+}
+
+# ---------- WebApp 窗口 ----------
+webapp_running() {
+  # 纯进程检测，关窗瞬间即失效（osascript 判断 app running 对刚退出的 app 有约 10 秒延迟，弃用）
+  # 主判据：Web App 运行时 + --bundlepath 指向本 WebApp 壳（该签名只有本窗口主进程会有）
+  # 宽匹配兜底时排除 WebContent 孤儿与 -c 调试命令行，防误判"窗口还在"
+  local p cmd
+  pgrep -f "Web App --bundlepath $WEBAPP_APP" >/dev/null 2>&1 && return 0
+  for p in $(pgrep -f "$WEBAPP_ID" 2>/dev/null); do
+    cmd=$(ps -p "$p" -o command= 2>/dev/null)
+    case "$cmd" in *WebKit.WebContent*|*" -c "*) ;; *) return 0 ;; esac
+  done
+  return 1
+}
+
+open_webapp() {
+  # -b 按 bundle id 精准投递给 WebApp 壳；失败才退回按路径打开
+  open -b "$WEBAPP_ID" "http://127.0.0.1:$RPORT" 2>/dev/null || \
+  open "$WEBAPP_APP" "http://127.0.0.1:$RPORT" 2>/dev/null
+}
+
+# ---------- 跳板 ----------
+start_redirect() {  # $1 = 服务 URL；重建跳板
+  export SVC_URL="$1"
+  kill_port_listeners "$RPORT"
+  sleep 0.3
+  SPAWNED_PGID=""
+  spawn_group "$REDIRECT_LOG" node -e \
+    "require('http').createServer((q,s)=>{s.writeHead(302,{Location:process.env.SVC_URL});s.end()}).listen($RPORT,'127.0.0.1')"
+  RD_PGID=$SPAWNED_PGID
+  sleep 0.5
+  pgid_alive "$RD_PGID"
+}
+
+# ---------- 就绪等待 ----------
+wait_backend_url() {  # 最长 90 秒；成功回显服务打印的 URL
+  # 适配要求：服务需把形如 http://127.0.0.1:<port>/... 的地址打印到 stdout/stderr
+  local i url
+  for i in {1..90}; do
+    pgid_alive "$SVC_PGID" || return 1
+    url=$(grep -oE 'http://127\.0\.0\.1:[0-9]+/[^[:space:]]*' "$BACKEND_LOG" 2>/dev/null | head -1)
+    [ -n "$url" ] && { echo "$url"; return 0; }
+    sleep 1
+  done
+  return 1
+}
+
+# ---------- 守卫 ----------
+ensure_guard() {
+  # 守卫是独立后台进程：主实例退出后由它继续"窗口关 → 全清理"。
+  # app 本体因此能随点随退，每次点击 Dock 图标都重新执行本脚本。
+  local gp=""
+  [ -f "$STATE" ] && gp=$(grep -m1 '^S_GUARD_PID=' "$STATE" 2>/dev/null | cut -d= -f2-)
+  if [ -n "$gp" ] && ps -p "$gp" -o command= 2>/dev/null | grep -q -- "--guard"; then
+    log "guard alive: $gp"
+    return 0
+  fi
+  # 守卫必须从副本运行（而非 app bundle 里的原脚本）：
+  # 否则 macOS 会把守卫算成"app 还在运行"，之后每次点 Dock 图标都被吞
+  cp -f "$SELF" "$GUARD_COPY"
+  nohup /bin/zsh "$GUARD_COPY" --guard >> "$LAUNCHER_LOG" 2>&1 &
+  gp=$!
+  log "guard spawned: $gp"
+  { grep -v '^S_GUARD_PID=' "$STATE" 2>/dev/null; echo "S_GUARD_PID=$gp"; } > "$STATE.tmp" && mv "$STATE.tmp" "$STATE"
+}
+
+# ---------- 清理 ----------
+cleanup() {
+  log "cleanup: SVC_PGID=$SVC_PGID RD_PGID=$RD_PGID"
+  kill_group "$SVC_PGID"
+  kill_group "$RD_PGID"
+  kill_port_listeners "$RPORT"
+  # 只杀「Web App 运行时 + --bundlepath 指向本 WebApp 壳」的主进程（精确签名，避免误伤
+  # 命令行里恰好提到该 UUID / 路径的其他进程——别用 UUID 宽匹配 pkill）
+  pkill -f "Web App --bundlepath $WEBAPP_APP" 2>/dev/null
+  # WebKit 渲染孤儿：命令行无特征（ppid 恒为 1 的 XPC 进程），
+  # 靠它「打开的文件」里的 WebApp 容器 UUID 精确识别，再补一刀
+  sleep 1
+  local p
+  for p in $(pgrep -f "com.apple.WebKit.WebContent" 2>/dev/null); do
+    lsof -p "$p" 2>/dev/null | grep -q "$WEBAPP_UUID" && kill "$p" 2>/dev/null
+  done
+  rm -f "$STATE"
+  log "cleanup done"
+}
+trap 'cleanup; exit 0' INT TERM HUP
+
+# ================ 守卫模式（--guard：由主实例派生的独立后台进程） ================
+if [ "$1" = "--guard" ]; then
+  read_state || { log "guard: no state, exit"; exit 0; }
+  SVC_PGID="$S_SVC_PGID"; SVC_URL="$S_URL"
+  log "guard up: SVC_PGID=$SVC_PGID"
+  while true; do
+    sleep 2
+    if ! pgid_alive "$SVC_PGID"; then log "backend died"; break; fi
+    if ! webapp_running; then log "window closed"; break; fi
+  done
+  cleanup
+  exit 0
+fi
+
+# ================= 主流程 =================
+: > "$LAUNCHER_LOG"
+if read_state && pgid_alive "$S_SVC_PGID"; then
+  # —— 服务已在运行：复用 ——
+  log "reuse: pgid=$S_SVC_PGID url=$S_URL"
+  SVC_PGID="$S_SVC_PGID"; SVC_URL="$S_URL"
+  # 跳板健康（302 已指向当前 URL）就不重建，消除重建瞬间的连线空窗
+  if [ "$(curl -s -o /dev/null -w '%{redirect_url}' --max-time 2 "http://127.0.0.1:$RPORT/" 2>/dev/null)" = "$SVC_URL" ]; then
+    log "redirect healthy; skip rebuild"
+  else
+    start_redirect "$SVC_URL" || { notify "跳板启动失败"; exit 1; }
+  fi
+  # 窗口活着 → 只激活带到前台（不重新导航，避免刷新你正在用的页面）；窗口不在 → 带 URL 拉起
+  if webapp_running; then
+    open -b "$WEBAPP_ID" 2>/dev/null || open "$WEBAPP_APP" 2>/dev/null
+  else
+    open_webapp || { notify "窗口打开失败"; exit 1; }
+  fi
+  ensure_guard
+  log "reuse done; exit"
+  exit 0
+else
+  # —— 冷启动 ——
+  notify "$APP_NAME 启动中…"
+  # 服务端口若被「启动器特征的旧进程」占用（见配置区 SVC_SIG）= 没被状态文件登记的孤儿，
+  # 先收尸再启动，杜绝并发出第二个服务；其它程序占用则退让到空闲端口。
+  for op in $(lsof -nP -tiTCP:"$PREFERRED_PORT" -sTCP:LISTEN 2>/dev/null); do
+    if ps -p "$op" -o command= 2>/dev/null | grep -q -- "$SVC_SIG"; then
+      log "reap orphan service on $PREFERRED_PORT: pid $op"
+      kill "$op" 2>/dev/null
+    fi
+  done
+  sleep 1
+  BPORT="$PREFERRED_PORT"
+  lsof -nP -tiTCP:"$PREFERRED_PORT" -sTCP:LISTEN >/dev/null 2>&1 && BPORT=0   # 被占则让系统挑空闲端口
+  log "cold start (port=$BPORT)"
+  : > "$BACKEND_LOG"
+  SPAWNED_PGID=""
+  spawn_group "$BACKEND_LOG" "${SVC_CMD[@]}" --port "$BPORT"
+  SVC_PGID=$SPAWNED_PGID
+  log "service pgid=$SVC_PGID"
+
+  SVC_URL=$(wait_backend_url) || {
+    log "service not ready (early exit or 90s timeout); retry once"
+    kill_group "$SVC_PGID"
+    : > "$BACKEND_LOG"
+    SPAWNED_PGID=""
+    spawn_group "$BACKEND_LOG" "${SVC_CMD[@]}" --port "$BPORT"
+    SVC_PGID=$SPAWNED_PGID
+    SVC_URL=$(wait_backend_url)
+  }
+
+  if [ -z "$SVC_URL" ]; then
+    log "service failed"
+    notify "$APP_NAME 启动失败"
+    cleanup; exit 1
+  fi
+  log "service ready: $SVC_URL"
+
+  start_redirect "$SVC_URL" || { log "redirect failed"; notify "跳板启动失败"; cleanup; exit 1; }
+  write_state
+  open_webapp || { log "open failed"; notify "窗口打开失败"; cleanup; exit 1; }
+fi
+
+# ---------- 等窗口出现（最多 30 秒） ----------
+for i in {1..30}; do
+  webapp_running && break
+  sleep 1
+done
+if ! webapp_running; then
+  log "window not seen"
+  notify "窗口未能打开"
+  cleanup; exit 1
+fi
+log "window up"
+notify "$APP_NAME 已就绪"
+
+# ---------- 交班：守卫进程继续守候，本体退出（app 恢复"未运行"，下次点击可再触发） ----------
+ensure_guard
+exit 0
