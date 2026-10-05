@@ -57,7 +57,7 @@ node -v   # 没有的话先装：https://nodejs.org 或 brew install node
 **2. 下载本仓库**
 
 ```bash
-git clone https://github.com/lioswift/dsh-launcher.git ~/Documents/dsh-launcher
+git clone https://github.com/lioswift/dsh-launcher-macOS.git ~/Documents/dsh-launcher
 cd ~/Documents/dsh-launcher
 ```
 
